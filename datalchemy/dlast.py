@@ -19,7 +19,7 @@ FLOAT_TYPE = 'float'
 class MetaVar:
     ''' meta var in arg position'''
     name: str
-    dtype: str
+    dtype: str = 'int'
 
 
 @dataclass
@@ -39,7 +39,7 @@ class Literal:
     name: str
     rel_decl: Declaration
     args: [Any]
-    negation: bool
+    negation: bool = False
 
 
 @dataclass
@@ -74,14 +74,63 @@ class OutputRel:
 class DatalogProgram:
     ''' a souffle like datalog program '''
     name: str
-    rel_decls: [Declaration]
-    clauses: [HornClause]
-    inputs: [InputRel]
-    output: [OutputRel]
+    rel_decls: [Declaration] = None
+    clauses: [HornClause] = None
+    inputs: [InputRel] = None
+    output: [str] = None
+    fact: [Fact] = None
 
+
+def is_metavar(arg):
+    ''' check if the type of a variable is metavar '''
+    if str(type(arg)).find('MetaVar') != -1:
+        return True
+    else:
+        return False
+
+
+def metavar_in_literal(literal: Literal) -> [MetaVar]:
+    ''' get all meta variable inside a literal '''
+    mv = []
+    for arg in literal.args:
+        if str(type(arg)).find('MetaVar') != -1:
+            mv.append(mv)
+    return mv
+
+def relname_in_caluse(clause: HornClause):
+    ''' get all rel name in a horn clause '''
+    name_in_head = clause.head.name
+    name_in_body = set()
+    for l in clause.body:
+        name_in_body.add(l.name)
+    name_in_body.add(name_in_head)
+    return name_in_body
 
 def is_facts_valid(fact: Fact):
     return len(fact.values) == len(fact.rel_decl.metavars)
+
+
+def remove_unused_metavar(clause: HornClause):
+    ''' replace all unused varibale in a horn clause with underscore '''
+    vheads = set()
+    for arg in clause.head.args:
+        # in py10 change to pattern match
+        if str(type(arg)).find('MetaVar') != -1:
+            vheads.add(arg.name)
+    newbody = []
+    for lit in clause.body:
+        newargs = []
+        for arg in lit.args:
+            if str(type(arg)).find('MetaVar') != -1:
+                if arg.name in vheads:
+                    newargs.append(arg)
+                else:
+                    newargs.append(UNDESCORE)
+            else:
+                newargs.append(arg)
+        newbody.append(Literal(lit.name, lit.rel_decl, newargs, lit.negation))
+    newclause = HornClause(clause.head, newbody)
+    return newclause
 
 
 def is_horn_clause_valid(clause: HornClause) -> bool:
@@ -98,7 +147,7 @@ def is_horn_clause_valid(clause: HornClause) -> bool:
         if str(type(arg)).find('MetaVar') != -1:
             vheads.add(arg.name)
     vbody = set()
-    for lit in vbody:
+    for lit in clause.body:
         for arg in lit.args:
             if str(type(arg)).find('MetaVar') != -1:
                 vbody.add(arg.name)
