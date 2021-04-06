@@ -29,6 +29,13 @@ def metatype_to_columntype(metavar: MetaVar):
         return String(255)
 
 
+def val_to_sql_str(v):
+    if type(v) == str:
+        return f"'{v}'"
+    else:
+        return str(v)
+
+
 class DatalogIntepretor:
     ''' interpretor '''
 
@@ -41,7 +48,7 @@ class DatalogIntepretor:
         self.output_relnames = []
         self.rel_graph = nx.DiGraph()
 
-    def run(self, program: DatalogProgram):
+    def run(self, program: DatalogProgram, silent=False):
         ''' run a datalog program '''
         for decl in program.rel_decls:
             self.add_declaration(decl)
@@ -53,7 +60,9 @@ class DatalogIntepretor:
         self.output_relnames = program.output
         # TODO: compute scc first
         self.compute_fixpoint(program.clauses)
-        self.print_output()
+        if not silent:
+            self.print_output()
+        return self.fetch_output()
 
     def add_fact(self, fact: Fact):
         ''' add a fact into EDB '''
@@ -95,15 +104,8 @@ class DatalogIntepretor:
         for metavar in decl.metavars:
             columns_new.append(
                 Column(metavar.name, metatype_to_columntype(metavar), nullable=False))
-        # tmp is just a duplication of delta table
-        columns_tmp = [
-            Column('pk', String, primary_key=True, nullable=False, unique=True)]
-        for metavar in decl.metavars:
-            columns_tmp.append(
-                Column(metavar.name, metatype_to_columntype(metavar), nullable=False))
         Table(decl.name, self.db_meta, *columns)
         Table(f'{decl.name}_new', self.db_meta, *columns_new)
-        Table(f'{decl.name}_tmp', self.db_meta, *columns_tmp)
         self.rels.append(decl)
 
     def add_clause(self, clause: HornClause):
@@ -148,36 +150,23 @@ class DatalogIntepretor:
             for _r in res:
                 print(_r)
 
+    def fetch_output(self):
+        ''' return output '''
+        outs = {}
+        for output_name in self.output_relnames:
+            tb = self.__get_table(output_name)
+            stmt = select(tb)
+            res = self.db_conn.execute(stmt)
+            outs[output_name] = [_r[1:] for _r in res]
+        return outs
+
     def __turncate_Δ(self):
         ''' turncate all Δ table '''
         for _r in self.rels:
             tb_delta = self.__get_Δ_table(_r.name)
             stmt = delete(tb_delta)
             self.db_conn.execution_options(autocommit=False).execute(stmt)
-            tb_tmp = self.__get_tmp_table(_r.name)
-            self.db_conn.execution_options(
-                autocommit=False).execute(delete(tb_tmp))
         self.db_conn.execute(text('COMMIT'))
-
-    def __turncate_tmp(self, rel):
-        ''' turncate tmp table '''
-        tb_tmp = self.__get_tmp_table(rel.name)
-        self.db_conn.execution_options(
-            autocommit=False).execute(delete(tb_tmp))
-        self.db_conn.execute(text('COMMIT'))
-
-    def __refresh_tmp(self, rel):
-        ''' delete all in tmp make it same as Δ '''
-        self.__turncate_tmp(rel.name)
-        Δ_table = self.__get_Δ_table(rel.name)
-        tmp_table = self.__get_tmp_table(rel.name)
-        col_names = ['pk'] + [m.name for m in rel.metavars]
-        select_stmt = select(*Δ_table.c)
-        stmt = (
-            insert(tmp_table).
-            from_select(col_names, select_stmt)
-        )
-        self.db_conn.execute(stmt)
 
     def __create_table(self):
         self.db_meta.create_all()
@@ -190,27 +179,31 @@ class DatalogIntepretor:
         ''' get a sql Δ table in meta data by name '''
         return self.db_meta.tables[f'{name}_new']
 
-    def __get_tmp_table(self, name):
-        ''' get a sql Δ table in meta data by name '''
-        return self.db_meta.tables[f'{name}_tmp']
-
     def __select_horn_clause(self, clause: HornClause):
         ''' 
         select index for a horn clause, using naive index selection, just select on table
         which the meta variable first appear
+        this is too complicate in sqlalchemy, so I just assemble sql by hand
 
-        return select sql and index order in selection
+        return selected data
         '''
         # select metavar
         select_list = []
         selected_col_names = []
-        filter_list = []
+        from_list = []
+        where_list = []
         col_mv_map = {}
+        rel_counter_map = {}        # how many time a rel is referenced
         for lit in clause.body:
             lit_col_names = [m.name for m in lit.rel_decl.metavars]
+            if lit.name not in rel_counter_map.keys():
+                rel_counter_map[lit.name] = 1
+            else:
+                rel_counter_map[lit.name] = rel_counter_map[lit.name] + 1
+            table_name = f'{lit.name}_{rel_counter_map[lit.name]}'
+            from_list.append(f'{lit.name}_new AS {table_name}')
             for i, arg in enumerate(lit.args):
-                table = self.__get_Δ_table(lit.name)
-                col = getattr(table.c, lit_col_names[i])
+                col = f'{table_name}.{lit.rel_decl.metavars[i].name}'
                 if is_metavar(arg):
                     if arg.name not in col_mv_map.keys():
                         # select rule
@@ -218,24 +211,23 @@ class DatalogIntepretor:
                         select_list.append(col)
                         selected_col_names.append(lit_col_names[i])
                     else:
-                        # a join here
-                        filter_list.append(col == col_mv_map[arg.name])
+                        where_list.append(f'{col_mv_map[arg.name]} = {col}')
                 else:
-                    # where
-                    filter_list.append(col == arg)
-        # create query here
-        stmt = select(*select_list)
-        for fcond in filter_list:
-            stmt = stmt.filter(fcond)
-        print(stmt)
-        res = self.db_conn.execute(stmt)
+                    where_list.append(f'{col} = {val_to_sql_str(arg)}')
+        select_sql = f"SELECT {', '.join(select_list)} "
+        from_sql = f"FROM {', '.join(from_list)} "
+        if where_list == []:
+            where_sql = ''
+        else:
+            where_sql = f"WHERE {' AND '.join(where_list)}"
+        stmt = select_sql + from_sql + where_sql + ';'
+        res = self.db_conn.execute(text(stmt))
         val_mv_list = []
         for _r in res:
             rdict = {}
             for i, k in enumerate(selected_col_names):
                 rdict[k] = _r[i]
             val_mv_list.append(rdict)
-        print(val_mv_list)
         return val_mv_list
 
     def __drain_Δ(self):
@@ -315,5 +307,4 @@ class DatalogIntepretor:
                         prefix_with('OR IGNORE')
                     )
                     self.db_conn.execute(stmt)
-                self.__refresh_tmp(clause.head.rel_decl)
             self.__drain_Δ()
