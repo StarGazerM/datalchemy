@@ -6,16 +6,16 @@ Yihao Sun
 '''
 
 import sys
+import time
 
 import networkx as nx
-# import pandas as pd
 from sqlalchemy import create_engine, Table, MetaData, Column
 from sqlalchemy import Integer, Float, String
 from sqlalchemy import insert, func, text, delete, select
 
 from datalchemy.dlast import MetaVar, DatalogProgram, Fact, Declaration, HornClause
-from datalchemy.dlast import is_metavar, is_facts_valid, is_horn_clause_valid, remove_unused_metavar, metavar_in_literal, relname_in_caluse
-from datalchemy.dlast import INT_TYPE, SYM_TYPE, FLOAT_TYPE
+from datalchemy.dlast import is_metavar, is_facts_valid, is_horn_clause_valid, metavar_in_literal, relname_in_caluse
+from datalchemy.dlast import INT_TYPE, SYM_TYPE, FLOAT_TYPE, UNDESCORE
 
 
 def metatype_to_columntype(metavar: MetaVar):
@@ -59,7 +59,22 @@ class DatalogIntepretor:
             self.add_fact(fact)
         self.output_relnames = program.output
         # TODO: compute scc first
-        self.compute_fixpoint(program.clauses)
+        while True:
+            sccs = list(nx.strongly_connected_components(self.rel_graph))
+            if sccs == []:
+                break
+            computed = []
+            for scc in sccs:
+                scc_clauses = list(
+                    filter(lambda c: c.head.name in scc, self.clauses))
+                # print(f'computing relation {scc}')
+                if scc_clauses == []:
+                    computed = computed + list(scc)
+                    continue
+                self.compute_fixpoint(scc_clauses)
+                computed = computed + list(scc)
+            self.rel_graph.remove_nodes_from(computed)
+        # self.compute_fixpoint(program.clauses)
         if not silent:
             self.print_output()
         return self.fetch_output()
@@ -77,7 +92,6 @@ class DatalogIntepretor:
             pk_str = pk_str + str(v)
         val_dict = {}
         val_dict['pk'] = pk_str
-        # val_dict = {k: v for k in col_names for v in fact.values}
         for i, name in enumerate(col_names):
             val_dict[name] = fact.values[i]
         # find table name in meta data
@@ -86,7 +100,6 @@ class DatalogIntepretor:
             values(**val_dict).
             prefix_with('OR IGNORE')
         )
-        # conn = self.engine.connect()
         self.db_conn.execute(stmt)
 
     def add_declaration(self, decl: Declaration):
@@ -113,13 +126,15 @@ class DatalogIntepretor:
         if not is_horn_clause_valid(clause):
             print(f'HornClause {str(clause)} has ungrounded variable')
             sys.exit(3)
-        clause = remove_unused_metavar(clause)
+        # clause = remove_unused_metavar(clause)
         hname = clause.head.name
         for lit in clause.body:
+            if lit.name == hname:
+                continue
             if self.rel_graph.has_edge(lit.name, hname):
                 self.rel_graph[lit.name][hname]['weight'] = self.rel_graph[lit.name][hname]['weight'] + 1
             else:
-                self.rel_graph.add_weighted_edges_from([(lit.name, hname, 1)])
+                self.rel_graph.add_weighted_edges_from([(hname, lit.name, 1)])
         self.clauses.append(clause)
 
     def print_rel(self, rel_name):
@@ -148,7 +163,7 @@ class DatalogIntepretor:
             stmt = select(tb)
             res = self.db_conn.execute(stmt)
             for _r in res:
-                print(_r)
+                print(_r[1:])
 
     def fetch_output(self):
         ''' return output '''
@@ -160,13 +175,11 @@ class DatalogIntepretor:
             outs[output_name] = [_r[1:] for _r in res]
         return outs
 
-    def __turncate_Δ(self):
-        ''' turncate all Δ table '''
-        for _r in self.rels:
-            tb_delta = self.__get_Δ_table(_r.name)
-            stmt = delete(tb_delta)
-            self.db_conn.execution_options(autocommit=False).execute(stmt)
-        self.db_conn.execute(text('COMMIT'))
+    def __turncate_Δ(self, rel: Declaration):
+        ''' turncate Δ table of given relation '''
+        tb_delta = self.__get_Δ_table(rel.name)
+        stmt = delete(tb_delta)
+        self.db_conn.execution_options(autocommit=True).execute(stmt)
 
     def __create_table(self):
         self.db_meta.create_all()
@@ -212,6 +225,8 @@ class DatalogIntepretor:
                         selected_col_names.append(lit_col_names[i])
                     else:
                         where_list.append(f'{col_mv_map[arg.name]} = {col}')
+                elif arg == UNDESCORE:
+                    continue
                 else:
                     where_list.append(f'{col} = {val_to_sql_str(arg)}')
         select_sql = f"SELECT {', '.join(select_list)} "
@@ -230,23 +245,9 @@ class DatalogIntepretor:
             val_mv_list.append(rdict)
         return val_mv_list
 
-    def __drain_Δ(self):
-        ''' move all data inside delta table into IDB '''
-        for rel in self.rels:
-            table = self.__get_table(rel.name)
-            Δ_table = self.__get_Δ_table(rel.name)
-            col_names = ['pk'] + [m.name for m in rel.metavars]
-            select_stmt = select(*Δ_table.c)
-            stmt = (
-                insert(table).
-                prefix_with('OR IGNORE').
-                from_select(col_names, select_stmt)
-            )
-            self.db_conn.execute(stmt)
-
-    def __fullfill_Δ(self):
-        ''' copy everything inside IDB into Δ '''
-        for rel in self.rels:
+    def __fullfill_Δ(self, relations):
+        ''' copy everything inside IDB into Δ in a given relation name set '''
+        for rel in relations:
             table = self.__get_table(rel.name)
             Δ_table = self.__get_Δ_table(rel.name)
             col_names = ['pk'] + [m.name for m in rel.metavars]
@@ -263,10 +264,14 @@ class DatalogIntepretor:
         '''
         # all relation name needed to be computed
         rel_names = set()
+        rel_in_clauases = []
         for c in clauses:
             rel_names = rel_names.union(relname_in_caluse(c))
+        for _r in self.rels:
+            if _r.name in rel_names:
+                rel_in_clauases.append(_r)
         # let Δ = original at the begining of algorithm
-        self.__fullfill_Δ()
+        self.__fullfill_Δ(rel_in_clauases)
         # only need to keep track of the number of record inside db
         # the result of sqlalchemy will not contain any info when executing multi instert so put this silly code here
         prev_count = 0
@@ -278,16 +283,15 @@ class DatalogIntepretor:
                 res = self.db_conn.execute(stmt)
                 Δ_count = Δ_count + res.fetchone()[0]
             if Δ_count == prev_count:
-                print('reach fixpoint')
+                print('reach fixpoint!')
                 break
             prev_count = Δ_count
             for clause in clauses:
-                # used_mv = metavar_in_literal(clause.head)
-                target_table = self.__get_Δ_table(clause.head.name)
+                target_table = self.__get_table(clause.head.name)
+                target_Δ_table = self.__get_Δ_table(clause.head.name)
                 target_mvs = [mv.name for mv in clause.head.rel_decl.metavars]
                 selected_data = self.__select_horn_clause(clause)
                 # create values
-                # val_map = {}
                 for i, arg in enumerate(clause.head.args):
                     if not is_metavar(arg):
                         selected_data = map(lambda x: x.update(
@@ -301,10 +305,17 @@ class DatalogIntepretor:
                             pk_str = pk_str + str(arg)
                         d['pk'] = pk_str
                         # selected_data_with_pk.append()
+                    # b = b ∪ new_b;
                     stmt = (
                         insert(target_table).
                         values(selected_data).
                         prefix_with('OR IGNORE')
                     )
                     self.db_conn.execute(stmt)
-            self.__drain_Δ()
+                    # Δb = new_b
+                    self.__turncate_Δ(clause.head.rel_decl)
+                    stmt = (
+                        insert(target_Δ_table).
+                        values(selected_data)
+                    )
+                    self.db_conn.execute(stmt)
